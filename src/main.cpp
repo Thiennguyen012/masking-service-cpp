@@ -171,6 +171,35 @@ std::string base64Encode(const std::vector<u8>& data) {
     return out;
 }
 
+std::vector<u8> base64Decode(const std::string& input) {
+    static std::array<int, 256> T = [] {
+        std::array<int, 256> table{};
+        table.fill(-1);
+        const std::string alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        for (int i = 0; i < static_cast<int>(alphabet.size()); i++) {
+            table[static_cast<unsigned char>(alphabet[i])] = i;
+        }
+        return table;
+    }();
+
+    std::vector<u8> out;
+    int val = 0;
+    int valb = -8;
+    for (unsigned char c : input) {
+        if (std::isspace(c)) continue;
+        if (c == '=') break;
+        int d = T[c];
+        if (d == -1) break;
+        val = (val << 6) + d;
+        valb += 6;
+        if (valb >= 0) {
+            out.push_back(static_cast<u8>((val >> valb) & 0xFF));
+            valb -= 8;
+        }
+    }
+    return out;
+}
+
 // ============================================================
 // AES-128 (logic implementation, CTR mode)
 // ============================================================
@@ -475,12 +504,104 @@ int main() {
         }
     });
 
+    // Decrypt flow: decrypt AES key by RSA private key, then decrypt payload.
+    svr.Post("/decrypt", [](const httplib::Request& req, httplib::Response& res) {
+        try {
+            json body = json::parse(req.body);
+            if (!body.contains("encrypted_data") || !body["encrypted_data"].is_object()) {
+                res.status = 400;
+                res.set_content(R"({"error":"Missing encrypted_data object"})", "application/json");
+                return;
+            }
+            if (!body.contains("rsa") || !body["rsa"].is_object()) {
+                res.status = 400;
+                res.set_content(R"({"error":"Missing rsa object"})", "application/json");
+                return;
+            }
+
+            const json encryptedData = body["encrypted_data"];
+            const json rsaObj = body["rsa"];
+
+            if (!encryptedData.contains("payload") || !encryptedData.contains("iv") || !encryptedData.contains("encrypted_key")) {
+                res.status = 400;
+                res.set_content(R"({"error":"Missing encrypted_data fields"})", "application/json");
+                return;
+            }
+            if (!rsaObj.contains("n") || !rsaObj.contains("d")) {
+                res.status = 400;
+                res.set_content(R"({"error":"Missing rsa.n or rsa.d"})", "application/json");
+                return;
+            }
+
+            u64 n = 0;
+            u64 d = 0;
+            const std::string nStr = rsaObj["n"].is_string() ? rsaObj["n"].get<std::string>() : std::to_string(rsaObj["n"].get<u64>());
+            const std::string dStr = rsaObj["d"].is_string() ? rsaObj["d"].get<std::string>() : std::to_string(rsaObj["d"].get<u64>());
+            if (!parseU64(nStr, n) || !parseU64(dStr, d) || n <= 257 || d <= 1) {
+                res.status = 400;
+                res.set_content(R"({"error":"Invalid RSA n/d"})", "application/json");
+                return;
+            }
+
+            if (!encryptedData["encrypted_key"].is_array()) {
+                res.status = 400;
+                res.set_content(R"({"error":"encrypted_key must be array"})", "application/json");
+                return;
+            }
+
+            std::vector<u8> keyBytes;
+            for (const auto& item : encryptedData["encrypted_key"]) {
+                std::string cStr = item.is_string() ? item.get<std::string>() : std::to_string(item.get<u64>());
+                u64 c = 0;
+                if (!parseU64(cStr, c)) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"Invalid encrypted_key item"})", "application/json");
+                    return;
+                }
+                const u64 m = modPow(c, d, n);
+                keyBytes.push_back(static_cast<u8>(m & 0xFF));
+            }
+
+            if (keyBytes.size() != 16) {
+                res.status = 400;
+                res.set_content(R"({"error":"Invalid AES key length"})", "application/json");
+                return;
+            }
+
+            const std::vector<u8> ivBytes = base64Decode(encryptedData["iv"].get<std::string>());
+            const std::vector<u8> payloadBytes = base64Decode(encryptedData["payload"].get<std::string>());
+            if (ivBytes.size() != 16) {
+                res.status = 400;
+                res.set_content(R"({"error":"Invalid IV length"})", "application/json");
+                return;
+            }
+
+            std::array<u8, 16> key{};
+            std::array<u8, 16> iv{};
+            std::copy(keyBytes.begin(), keyBytes.end(), key.begin());
+            std::copy(ivBytes.begin(), ivBytes.end(), iv.begin());
+
+            const std::vector<u8> plainBytes = aes128CtrTransform(payloadBytes, key, iv);
+            const std::string plaintext(plainBytes.begin(), plainBytes.end());
+            const json data = json::parse(plaintext);
+            res.set_content(safe_json_dump(data), "application/json");
+        } catch (const std::exception& e) {
+            json error = {
+                {"error", "Internal error"},
+                {"detail", e.what()}
+            };
+            res.status = 500;
+            res.set_content(safe_json_dump(error), "application/json");
+        }
+    });
+
     std::cout << "=== Data Masking + Crypto Service ===" << std::endl;
     std::cout << "Listening on http://0.0.0.0:8080" << std::endl;
     std::cout << "Endpoints:" << std::endl;
     std::cout << "  GET  /health" << std::endl;
     std::cout << "  POST /mask" << std::endl;
     std::cout << "  POST /secure-mask" << std::endl;
+    std::cout << "  POST /decrypt" << std::endl;
 
     svr.listen("0.0.0.0", 8080);
     return 0;
